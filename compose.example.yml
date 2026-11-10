@@ -1,0 +1,24 @@
+# Example: run the published image with your pairing bundle.
+#
+#   cp compose.example.yml compose.yml
+#   ./pair.sh                     # on a Linux machine with Bluetooth; prints
+#                                 # the MUSE_PAIRING_B64=... line
+#   # create .env next to compose.yml (mode 0600), containing:
+#   #   MUSE_PAIRING_B64=<the line pair.sh printed>
+#   #   SHIM_API_KEY=<a long random key you choose>
+#   docker compose up -d
+#
+# .env holds a live credential for your Muse: chmod 600 it and NEVER commit it.
+# Only ONE running container may use a given pairing at a time.
+services:
+  muse-openclaw-shim:
+    # Pin a release tag (or a digest) instead of latest for production.
+    image: ghcr.io/timothylock/muse-openclaw-shim:latest
+    env_file: .env
+    ports:
+      # Loopback by default. Set SHIM_BIND=0.0.0.0 (in your shell, or in a
+      # .env read by compose) only behind a firewall / TLS reverse proxy.
+      - "${SHIM_BIND:-127.0.0.1}:18611:8080"
+    restart: unless-stopped
+    # No volumes: the bundle is unpacked into the container's /dev/shm (tmpfs).
+    # See README "Token rotation and restarts" before deciding otherwise.

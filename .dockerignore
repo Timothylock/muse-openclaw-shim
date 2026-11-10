@@ -1,0 +1,7 @@
+# Allowlist: only what the image needs enters the build context, so a stray
+# .env or pairing bundle in the checkout can never be baked into an image.
+*
+!Dockerfile
+!entrypoint.sh
+!shim.py
+!pairing_bundle.py
