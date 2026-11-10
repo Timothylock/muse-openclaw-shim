@@ -25,6 +25,15 @@
 # Never echoes or logs the SDK token. Needs: bash, GNU tar, coreutils, python3
 # (and for pairing: bluez, python3-dbus, python3-gi, python3-cryptography, git,
 # curl).
+
+# This script needs bash (arrays, pipefail). If it was started with another
+# shell (e.g. `sh pair.sh`), re-exec under bash. Written in POSIX sh on
+# purpose: it has to run before any bash-only syntax is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  if command -v bash >/dev/null 2>&1; then exec bash "$0" "$@"; fi
+  echo "pair.sh: bash is required but was not found" >&2; exit 1
+fi
+
 set -euo pipefail
 umask 077
 export LC_ALL=C
@@ -49,6 +58,18 @@ warn() { printf 'pair.sh: warning: %s\n' "$*" >&2; }
 die()  { printf 'pair.sh: %s\n' "$*" >&2; exit 1; }
 
 usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; }
+
+# Pairing talks to BlueZ over D-Bus, so it is Linux only: the Muse Gadget
+# SDK has no macOS pairing path, and neither Docker Desktop nor a VM on a
+# Mac can see the host's Bluetooth radio. Bundling an existing state dir
+# (--state) never pairs, so it is allowed on any OS.
+HAS_STATE=0
+for a in "$@"; do
+  case "$a" in --state|--state=*) HAS_STATE=1 ;; esac
+done
+if [ "$(uname -s)" != "Linux" ] && [ "$HAS_STATE" -eq 0 ]; then
+  die "pairing needs Linux (found $(uname -s)): the SDK pairs over BlueZ, which this OS does not have, and Docker or a VM here cannot reach the built in Bluetooth radio either. Options: run pair.sh on any Linux machine with Bluetooth, boot a Linux live USB, or plug a USB Bluetooth dongle into a Linux machine (for example the server that will run the image) and pair there. Already have a paired state dir? './pair.sh --state DIR' bundles it and works anywhere."
+fi
 
 OUTPUT="" FROM_STATE="" FORCE=0 PRINT_ENV=0
 while [ "$#" -gt 0 ]; do
