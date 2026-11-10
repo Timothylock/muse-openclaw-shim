@@ -4,15 +4,10 @@ An OpenAI-compatible HTTP shim that lets OpenClaw-style clients talk to your
 own Muse agent. For example: Even Realities G2 glasses via
 the Even app, or anything else that speaks `POST /v1/chat/completions`.
 
-It has two transports:
-
-- **Muse Gadget SDK (recommended).** The shim acts as a paired Muse Gadget,
-  using the official
-  [Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk).
-  This is what the Docker image runs.
-- **muse-cli.** The shim drives a logged-in `muse-cli` (session cookies).
-  Run `shim.py` directly on a host where `muse-cli` works, with
-  `SHIM_BACKEND=muse-cli`. The image doesn't include this transport.
+The shim talks to Muse through the official
+[Muse Gadget SDK](https://github.com/facebookincubator/muse-gadget-sdk): the
+container runs as a paired Muse Gadget, and the shim forwards each message
+with `musegadget send-user-msg`.
 
 Pairing and running are separate. `pair.sh` pairs a gadget on any Linux
 machine with Bluetooth and writes one **bundle** file. The image takes that
@@ -180,13 +175,12 @@ top-level `secrets:` entry with `file:` and the same ownership rule.
 | `MUSE_SOCKET_WAIT` | `30` | image | Seconds to wait for the service socket in `run` mode. |
 | `SHIM_RUN_AS` | `shim` | image | Account the shim runs as. |
 | `SHIM_API_KEY` | generated | shim | Bearer key clients must send. If unset, one is generated into `$SHIM_DATA_DIR/api_key`. |
-| `SHIM_BACKEND` | `gadget` (image), `muse-cli` (shim.py) | shim | Transport: `gadget` or `muse-cli`. |
 | `HOST` / `PORT` | `0.0.0.0` / `8080` | shim | Listen address. |
 | `SHIM_DATA_DIR` | `/var/lib/muse-shim` (image) | shim | Per-user thread map and generated key. |
 | `SHIM_MODEL_ID` | `muse` | shim | Model id reported by `/v1/models`. |
 | `SHIM_MSG_PREFIX` | terse-reply instruction for glasses | shim | Text prepended to every message. Set it to an empty string to disable. |
-| `SHIM_SEND_TIMEOUT`, `SHIM_SESSION_TIMEOUT`, `SHIM_HEARTBEAT` | `300`, `60`, `10` | shim | Timeouts (s) and the SSE heartbeat interval. |
-| `MUSE_CLI`, `GADGET_CLI` | `muse-cli`, `musegadget` | shim | Binaries for each transport. |
+| `SHIM_HEARTBEAT` | `10` | shim | SSE heartbeat interval (s). |
+| `GADGET_CLI` | `musegadget` | shim | The `musegadget` binary the shim runs. |
 | `MUSE_PAIR_STATE_DIR` | `$XDG_DATA_HOME/muse-pair/state` | pair.sh | Where pair.sh keeps the gadget state. |
 
 ### Shim API

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible HTTP shim in front of muse-cli.
+"""muse-openclaw-shim: OpenAI-compatible HTTP shim in front of the Muse Gadget SDK.
 
 Stdlib only. Endpoints:
   GET  /healthz              open, no auth
   GET  /v1/models            Bearer SHIM_API_KEY
   POST /v1/chat/completions  Bearer SHIM_API_KEY (stream or non-stream)
 
-Only the last user message of each request is forwarded; muse keeps the
-conversation state in a per-user side chat (threads.json maps user -> thread).
-Only `muse-cli session-start` and `muse-cli send` are ever invoked, always via
-an argument list (never a shell, never `muse-cli raw`).
-
-SHIM_BACKEND=gadget switches to the Muse Gadget SDK instead: the shim then
-only ever runs `musegadget send-user-msg` (a socket client to a separately
-running `musegadget run` service), with a per-user uuid4 as --session-id.
+Only the last user message of each request is forwarded; Muse keeps the
+conversation state in a per-user side chat (threads.json maps user -> session
+UUID). The only command ever run is `musegadget send-user-msg` (a socket
+client to a separately running `musegadget run` service), always via an
+argument list (never a shell), with the message on stdin.
 """
 
 import hmac
@@ -39,17 +36,12 @@ MSG_PREFIX = os.environ.get(
     "numbers only. Max 2 short lines. No markdown, no links, no greetings. "
     "Be fast: answer direct, at most one quick lookup, no extra tool "
     "calls.]\n\n")
-MUSE_CLI = os.environ.get("MUSE_CLI", "muse-cli")
-SHIM_BACKEND = os.environ.get("SHIM_BACKEND", "muse-cli").strip() or "muse-cli"
 GADGET_CLI = os.environ.get("GADGET_CLI", "musegadget")
-GADGET_PREFIX = "gadget:"       # threads.json id namespace for the gadget backend
-GADGET_SEND_TIMEOUT = 280 + 45  # CLI's own socket timeout is wait+30s
 DATA_DIR = os.environ.get("SHIM_DATA_DIR") or os.path.join(
-    os.path.expanduser("~"), ".muse-cli-shim")
+    os.path.expanduser("~"), ".muse-openclaw-shim")
 MAX_BODY = 1024 * 1024          # 1 MB request cap
-SEND_WAIT = 280                 # passed to muse-cli send --wait
-SEND_TIMEOUT = float(os.environ.get("SHIM_SEND_TIMEOUT", "300"))
-SESSION_TIMEOUT = float(os.environ.get("SHIM_SESSION_TIMEOUT", "60"))
+SEND_WAIT = 280                 # passed to send-user-msg --wait
+SEND_TIMEOUT = SEND_WAIT + 45   # the CLI's own socket timeout is wait+30s
 HEARTBEAT = float(os.environ.get("SHIM_HEARTBEAT", "10"))
 RETRIES = 1                     # exactly one retry after a failed send
 
@@ -87,64 +79,22 @@ def load_api_key():
 
 
 # --------------------------------------------------------------------------
-# muse-cli wrapper
+# Muse Gadget SDK transport
 
 class MuseError(Exception):
     pass
 
 
-def _env():
-    env = dict(os.environ)
-    env["MUSE_NO_UPDATE_CHECK"] = "1"
-    return env
-
-
-def _run(args, timeout):
-    """Run muse-cli with an argument list; return parsed JSON stdout."""
-    try:
-        p = subprocess.run([MUSE_CLI] + args, capture_output=True, text=True,
-                           timeout=timeout, env=_env(), stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        raise MuseError(f"timeout after {timeout:g}s")
-    except OSError as e:
-        raise MuseError(f"cannot run muse-cli: {e.__class__.__name__}")
-    if p.returncode != 0:
-        raise MuseError(f"exit {p.returncode}")
-    try:
-        return json.loads(p.stdout)
-    except (json.JSONDecodeError, ValueError):
-        raise MuseError("unparseable output")
-
-
-def muse_session_start(title):
-    data = _run(["session-start", "--title", title], SESSION_TIMEOUT)
-    sid = data.get("session_id") or data.get("id") if isinstance(data, dict) else None
-    if not sid:
-        raise MuseError("session-start returned no session id")
-    return str(sid)
-
-
-def muse_send_once(thread, text):
-    data = _run(["send", "--thread", thread, "--wait", str(SEND_WAIT), "--", text],
-                SEND_TIMEOUT)
-    reply = data.get("reply") if isinstance(data, dict) else None
-    out = (reply or {}).get("text") if isinstance(reply, dict) else None
-    if not out or not str(out).strip():
-        raise MuseError("no reply")
-    return str(out)
-
-
-def gadget_send_once(thread, text):
+def send_once(session_id, text):
     """One `musegadget send-user-msg` call; text goes on stdin ("-")."""
-    sid = thread[len(GADGET_PREFIX):]
     try:
         p = subprocess.run(
-            [GADGET_CLI, "send-user-msg", "--session-id", sid,
+            [GADGET_CLI, "send-user-msg", "--session-id", session_id,
              "--wait", str(SEND_WAIT), "-"],
             input=text, capture_output=True, text=True,
-            timeout=GADGET_SEND_TIMEOUT)
+            timeout=SEND_TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise MuseError(f"timeout after {GADGET_SEND_TIMEOUT:g}s")
+        raise MuseError(f"timeout after {SEND_TIMEOUT:g}s")
     except OSError as e:
         raise MuseError(f"cannot run musegadget: {e.__class__.__name__}")
     # exit 3 = sent but unanswered (stdout may hold partial text); any
@@ -157,64 +107,32 @@ def gadget_send_once(thread, text):
     return out
 
 
-class MuseCliBackend:
-    name = "muse-cli"
-
-    def owns(self, tid):
-        return not tid.startswith(GADGET_PREFIX)
-
-    def new_thread(self, user):
-        return muse_session_start(f"shim-{user}")
-
-    def send_once(self, tid, text):
-        return muse_send_once(tid, text)
-
-
-class GadgetBackend:
-    name = "gadget"
-
-    def owns(self, tid):
-        return tid.startswith(GADGET_PREFIX)
-
-    def new_thread(self, user):
-        # A fresh --session-id starts a new side chat on first use.
-        return GADGET_PREFIX + str(uuid.uuid4())
-
-    def send_once(self, tid, text):
-        return gadget_send_once(tid, text)
-
-
-BACKENDS = {"muse-cli": MuseCliBackend, "gadget": GadgetBackend}
-
-
-def make_backend(name=None):
-    name = name or SHIM_BACKEND
-    if name not in BACKENDS:
-        raise SystemExit(f"unknown SHIM_BACKEND {name!r} "
-                         f"(expected one of: {', '.join(BACKENDS)})")
-    return BACKENDS[name]()
-
-
-def muse_send(thread, text, backend=None):
+def muse_send(session_id, text):
     """Send with exactly one retry. Returns (text, attempts)."""
-    send_once = backend.send_once if backend else muse_send_once
     last = None
     for attempt in range(1 + RETRIES):
         try:
-            return send_once(thread, text), attempt + 1
+            return send_once(session_id, text), attempt + 1
         except MuseError as e:
             last = e
-            log(f"send attempt {attempt + 1} failed thread={thread}: {e}")
+            log(f"send attempt {attempt + 1} failed thread={session_id}: {e}")
     raise MuseError(f"failed after {1 + RETRIES} attempts: {last}")
 
 
+def is_session_id(value):
+    """True for a canonical UUID string, the only thing threads.json stores."""
+    try:
+        return str(uuid.UUID(value)) == value
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 # --------------------------------------------------------------------------
-# per-user thread map
+# per-user session map
 
 class ThreadStore:
-    def __init__(self, path, backend=None):
+    def __init__(self, path):
         self.path = path
-        self.backend = backend or MuseCliBackend()
         self.lock = threading.Lock()          # guards map + user_locks
         self.user_locks = {}
         self.send_locks = {}
@@ -256,12 +174,13 @@ class ThreadStore:
         with self._lock_for(self.user_locks, user):
             with self.lock:
                 tid = self.map.get(user)
-            if tid and self.backend.owns(tid):
+            if tid and is_session_id(tid):
                 return tid, False
             if tid:
-                log(f"user={user} thread belongs to another backend; "
-                    f"starting a new {self.backend.name} thread")
-            tid = self.backend.new_thread(user)
+                log(f"user={user} stored session id is not a UUID; "
+                    f"starting a new session")
+            # A fresh --session-id starts a new side chat on first use.
+            tid = str(uuid.uuid4())
             with self.lock:
                 self.map[user] = tid
                 self._save()
@@ -299,7 +218,7 @@ def sanitize_user(u):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "muse-cli-shim/1.0"
+    server_version = "muse-openclaw-shim/1.0"
     protocol_version = "HTTP/1.1"
 
     # quiet default access log; we log our own lines without contents
@@ -420,7 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self.server.store
         tid, created = store.get_or_create(user)
         with store.send_lock(tid):
-            reply, attempts = muse_send(tid, text, store.backend)
+            reply, attempts = muse_send(tid, text)
         return tid, created, reply, attempts
 
     def _reply_json(self, model, started, reply):
@@ -460,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply_json(model, started, ent["reply"])
             log(f"POST chat user={user} stream=0 status=502 dedup=1 "
                 f"latency={time.time() - started:.1f}s err=leader_failed")
-            return self._error(502, "upstream muse-cli failed", "upstream_error")
+            return self._error(502, "upstream muse failed", "upstream_error")
         try:
             tid, created, reply, attempts = self._do_send(user, text)
         except MuseError as e:
@@ -468,7 +387,7 @@ class Handler(BaseHTTPRequestHandler):
             ent["event"].set()
             log(f"POST /v1/chat/completions user={user} stream=0 status=502 "
                 f"latency={time.time() - started:.1f}s err={e}")
-            return self._error(502, "upstream muse-cli failed", "upstream_error")
+            return self._error(502, "upstream muse failed", "upstream_error")
         ent["reply"] = reply
         ent["event"].set()
         log(f"POST /v1/chat/completions user={user} stream=0 status=200 thread={tid} "
@@ -525,7 +444,7 @@ class Handler(BaseHTTPRequestHandler):
                 status = "200"
                 extra = f"thread={tid} new_thread={int(created)} attempts={attempts}"
             else:
-                data({"error": {"message": "upstream muse-cli failed",
+                data({"error": {"message": "upstream muse failed",
                                 "type": "upstream_error"}})
                 status = "502"
                 extra = f"err={result.get('err')}"
@@ -543,7 +462,7 @@ def make_server(host, port, api_key=None, data_dir=None):
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     srv.api_key = api_key or load_api_key()
-    srv.store = ThreadStore(os.path.join(DATA_DIR, "threads.json"), make_backend())
+    srv.store = ThreadStore(os.path.join(DATA_DIR, "threads.json"))
     return srv
 
 
@@ -551,8 +470,7 @@ def main():
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     srv = make_server(host, port)
-    log(f"muse-cli-shim listening on {host}:{port} data_dir={DATA_DIR} "
-        f"backend={srv.store.backend.name}")
+    log(f"muse-openclaw-shim listening on {host}:{port} data_dir={DATA_DIR}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

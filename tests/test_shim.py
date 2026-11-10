@@ -1,7 +1,8 @@
 """Tests for shim.py. Run: python3 -m unittest discover -s tests -v
 
-Each test starts shim.py as a real subprocess with a fake `muse-cli` first on
-PATH, so subprocess invocation, env handling and HTTP framing are all exercised.
+Each test starts shim.py as a real subprocess with GADGET_CLI pointed at
+tests/fake_musegadget.py, so subprocess invocation, stdin handling, env
+handling and HTTP framing are all exercised.
 """
 import http.client
 import json
@@ -10,11 +11,12 @@ import shutil
 import socket
 import stat
 import subprocess
-import threading
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SHIM = os.path.join(os.path.dirname(HERE), "shim.py")
@@ -31,6 +33,7 @@ def free_port():
 
 class ShimCase(unittest.TestCase):
     api_key = KEY
+    seed_threads = None
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="shimtest-")
@@ -39,22 +42,25 @@ class ShimCase(unittest.TestCase):
         self.data = os.path.join(self.tmp, "data")
         os.makedirs(self.bin)
         os.makedirs(self.fake)
-        stub = os.path.join(self.bin, "muse-cli")
+        stub = os.path.join(self.bin, "fake-musegadget")
         with open(stub, "w") as f:
-            f.write(f"#!/bin/sh\nexec {sys.executable} {os.path.join(HERE, 'fake_muse_cli.py')} \"$@\"\n")
+            f.write(f"#!/bin/sh\nexec {sys.executable} "
+                    f"{os.path.join(HERE, 'fake_musegadget.py')} \"$@\"\n")
         os.chmod(stub, 0o755)
+        if self.seed_threads is not None:
+            os.makedirs(self.data, mode=0o700, exist_ok=True)
+            with open(os.path.join(self.data, "threads.json"), "w") as f:
+                json.dump(self.seed_threads, f)
         self.port = free_port()
         env = dict(os.environ)
-        env.update({"PATH": self.bin + os.pathsep + env.get("PATH", ""),
-                    "FAKE_MUSE_DIR": self.fake, "SHIM_DATA_DIR": self.data,
+        env.update({"GADGET_CLI": stub, "FAKE_GADGET_DIR": self.fake,
+                    "SHIM_DATA_DIR": self.data,
                     "HOST": "127.0.0.1", "PORT": str(self.port),
                     "SHIM_HEARTBEAT": "0.3"})
-        env.pop("MUSE_NO_UPDATE_CHECK", None)
         env.pop("SHIM_API_KEY", None)
         env["SHIM_MSG_PREFIX"] = getattr(self, "msg_prefix", "")
         if self.api_key:
             env["SHIM_API_KEY"] = self.api_key
-        self.prepare(env)
         self.proc = subprocess.Popen([sys.executable, SHIM], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.time() + 10
@@ -79,9 +85,6 @@ class ShimCase(unittest.TestCase):
             _, self.stderr = self.proc.communicate()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def prepare(self, env):
-        """Hook for subclasses: adjust env / seed files before the shim starts."""
-
     # helpers
     def set_mode(self, mode):
         with open(os.path.join(self.fake, "mode"), "w") as f:
@@ -93,6 +96,13 @@ class ShimCase(unittest.TestCase):
             return []
         with open(p) as f:
             return [json.loads(l) for l in f]
+
+    def sids(self):
+        return [c["argv"][2] for c in self.calls()]
+
+    def threads(self):
+        with open(os.path.join(self.data, "threads.json")) as f:
+            return json.load(f)
 
     def req(self, method, path, body=None, key=KEY, raw=None):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
@@ -120,11 +130,11 @@ class ShimCase(unittest.TestCase):
             body["user"] = user
         return self.req("POST", "/v1/chat/completions", body)
 
-    def send_calls(self):
-        return [c for c in self.calls() if c["argv"][0] == "send"]
+    def reply(self, body):
+        return json.loads(body)["choices"][0]["message"]["content"]
 
 
-class TestShim(ShimCase):
+class TestHttp(ShimCase):
     def test_healthz_open(self):
         r, body = self.req("GET", "/healthz", key=None)
         self.assertEqual(r.status, 200)
@@ -132,51 +142,26 @@ class TestShim(ShimCase):
 
     def test_401_without_or_with_wrong_key(self):
         for key in (None, "wrong"):
-            r, _ = self.req("GET", "/v1/models", key=key)
-            self.assertEqual(r.status, 401)
+            for path in ("/v1/models", "/models"):
+                r, _ = self.req("GET", path, key=key)
+                self.assertEqual(r.status, 401)
+                self.assertEqual(r.getheader("WWW-Authenticate"), "Bearer")
             r, _ = self.req("POST", "/v1/chat/completions",
                             {"messages": [{"role": "user", "content": "hi"}]}, key=key)
             self.assertEqual(r.status, 401)
         self.assertEqual(self.calls(), [])
 
     def test_models(self):
-        r, body = self.req("GET", "/v1/models")
-        self.assertEqual(r.status, 200)
-        d = json.loads(body)
-        self.assertEqual(d["object"], "list")
-        self.assertEqual(d["data"][0]["id"], "muse")
-
-    def test_completion_last_user_message_only(self):
-        r, body = self.chat("-n what is 2+2", user="alice")
-        self.assertEqual(r.status, 200, body)
-        d = json.loads(body)
-        self.assertEqual(d["object"], "chat.completion")
-        msg = d["choices"][0]["message"]
-        self.assertEqual(msg["role"], "assistant")
-        self.assertEqual(msg["content"], "echo[sess-1]: -n what is 2+2")
-        calls = self.calls()
-        self.assertEqual(calls[0]["argv"], ["session-start", "--title", "shim-alice"])
-        self.assertEqual(calls[1]["argv"],
-                         ["send", "--thread", "sess-1", "--wait", "280", "--", "-n what is 2+2"])
-        self.assertTrue(all(c["no_update"] == "1" for c in calls))
-        self.assertFalse(any(c["argv"][0] == "raw" for c in calls))
-        self.assertFalse(any("OLD-QUESTION" in a for c in calls for a in c["argv"]))
-        # threads.json persisted with mode 0600
-        tp = os.path.join(self.data, "threads.json")
-        with open(tp) as f:
-            self.assertEqual(json.load(f), {"alice": "sess-1"})
-        self.assertEqual(stat.S_IMODE(os.stat(tp).st_mode), 0o600)
-
-    def test_thread_reuse_per_user(self):
-        for txt in ("hello", "hello again"):
-            r, _ = self.chat(txt, user="alice")
+        for path in ("/v1/models", "/models"):
+            r, body = self.req("GET", path)
             self.assertEqual(r.status, 200)
-        r, body = self.chat("hello", user="bob")
-        self.assertEqual(r.status, 200)
-        self.assertIn("sess-2", json.loads(body)["choices"][0]["message"]["content"])
-        starts = [c for c in self.calls() if c["argv"][0] == "session-start"]
-        self.assertEqual([c["argv"][2] for c in starts], ["shim-alice", "shim-bob"])
-        self.assertEqual([c["argv"][2] for c in self.send_calls()], ["sess-1", "sess-1", "sess-2"])
+            d = json.loads(body)
+            self.assertEqual(d["object"], "list")
+            self.assertEqual(d["data"][0]["id"], "muse")
+
+    def test_server_header_branding(self):
+        r, _ = self.req("GET", "/healthz", key=None)
+        self.assertTrue(r.getheader("Server").startswith("muse-openclaw-shim/"))
 
     def test_even_app_root_post_and_hedge_dedup(self):
         # The Even app POSTs to the root of the configured URL with
@@ -196,34 +181,27 @@ class TestShim(ShimCase):
         for i in range(2):
             r, raw = results[i]
             self.assertEqual(r.status, 200, raw)
-            self.assertIn("what time is it",
-                          json.loads(raw)["choices"][0]["message"]["content"])
+            self.assertIn("what time is it", self.reply(raw))
+            self.assertEqual(json.loads(raw)["model"], "openclaw")
         # the hedged duplicate must not double-send to the agent
-        self.assertEqual(len(self.send_calls()), 1)
+        self.assertEqual(len(self.calls()), 1)
         # any other POST path is also a completion (single-purpose server)
         r, _ = self.req("POST", "/v1", body | {"messages": [
             {"role": "user", "content": "second question"}]})
         self.assertEqual(r.status, 200)
 
-    def test_retry_success(self):
-        self.set_mode("fail_once")
-        r, body = self.chat("retry me")
-        self.assertEqual(r.status, 200, body)
-        self.assertIn("retry me", json.loads(body)["choices"][0]["message"]["content"])
-        self.assertEqual(len(self.send_calls()), 2)
-
-    def test_retry_on_missing_reply(self):
-        self.set_mode("no_reply_once")
-        r, _ = self.chat("again")
-        self.assertEqual(r.status, 200)
-        self.assertEqual(len(self.send_calls()), 2)
-
-    def test_retry_exhausted_502(self):
-        self.set_mode("fail_always")
-        r, body = self.chat("doomed")
-        self.assertEqual(r.status, 502)
-        self.assertEqual(json.loads(body)["error"]["type"], "upstream_error")
-        self.assertEqual(len(self.send_calls()), 2)   # exactly one retry
+    def test_body_limits_and_bad_json(self):
+        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
+            s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                      b"Authorization: Bearer " + KEY.encode() + b"\r\n"
+                      b"Content-Length: 1048577\r\n\r\n{")
+            self.assertTrue(s.recv(4096).startswith(b"HTTP/1.1 413"))
+        r, _ = self.req("POST", "/v1/chat/completions", raw=b"{not json")
+        self.assertEqual(r.status, 400)
+        r, _ = self.req("POST", "/v1/chat/completions",
+                        {"messages": [{"role": "system", "content": "s"}]})
+        self.assertEqual(r.status, 400)
+        self.assertEqual(self.calls(), [])
 
     def test_streaming(self):
         self.set_mode("slow")   # 1.2s per send vs 0.3s heartbeat
@@ -235,9 +213,11 @@ class TestShim(ShimCase):
         events = [l[6:] for l in text.split("\n") if l.startswith("data: ")]
         self.assertEqual(events[-1], "[DONE]")
         chunks = [json.loads(e) for e in events[:-1]]
+        self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
         content = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks)
-        self.assertEqual(content, "echo[sess-1]: stream me")
+        self.assertEqual(content, f"echo[{self.sids()[0]}]: stream me")
         self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertTrue(all(c["object"] == "chat.completion.chunk" for c in chunks))
 
     def test_streaming_upstream_failure(self):
         self.set_mode("fail_always")
@@ -245,29 +225,123 @@ class TestShim(ShimCase):
         self.assertEqual(r.status, 200)
         events = [l[6:] for l in body.decode().split("\n") if l.startswith("data: ")]
         self.assertEqual(events[-1], "[DONE]")
-        self.assertIn("error", json.loads(events[0]))
+        err = json.loads(events[0])["error"]
+        self.assertEqual(err["type"], "upstream_error")
+        self.assertEqual(len(self.calls()), 2)
 
-    def test_body_limits_and_bad_json(self):
-        with socket.create_connection(("127.0.0.1", self.port), 5) as s:
-            s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
-                      b"Authorization: Bearer " + KEY.encode() + b"\r\n"
-                      b"Content-Length: 1048577\r\n\r\n{")
-            self.assertTrue(s.recv(4096).startswith(b"HTTP/1.1 413"))
-        r, _ = self.req("POST", "/v1/chat/completions", raw=b"{not json")
-        self.assertEqual(r.status, 400)
-        r, _ = self.req("POST", "/v1/chat/completions", {"messages": [{"role": "system", "content": "s"}]})
-        self.assertEqual(r.status, 400)
-        self.assertEqual(self.calls(), [])
-
-    def test_logs_have_no_message_contents(self):
-        self.set_mode("fail_once")
+    def test_logs_have_no_contents(self):
+        self.set_mode("exit3_once")
         self.chat("SECRET-CONTENT-XYZ", user="carol")
         self.proc.terminate()
         _, err = self.proc.communicate(timeout=5)
         log = err.decode()
+        self.assertIn("muse-openclaw-shim listening on", log)
         self.assertIn("user=carol", log)
+        self.assertIn("POST /v1/chat/completions status=200", log)  # access line
         self.assertNotIn("SECRET-CONTENT-XYZ", log)
+        self.assertNotIn("partial", log)
         self.assertNotIn(KEY, log)
+
+
+class TestSend(ShimCase):
+    def test_completion_via_send_user_msg(self):
+        r, body = self.chat("what is 2+2", user="alice")
+        self.assertEqual(r.status, 200, body)
+        d = json.loads(body)
+        self.assertEqual(d["object"], "chat.completion")
+        self.assertEqual(d["choices"][0]["message"]["role"], "assistant")
+        calls = self.calls()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertEqual(argv[:2], ["send-user-msg", "--session-id"])
+        self.assertEqual(argv[3:], ["--wait", "280", "-"])
+        sid = argv[2]
+        self.assertEqual(str(uuid.UUID(sid)), sid)
+        self.assertEqual(uuid.UUID(sid).version, 4)
+        self.assertEqual(self.reply(body), f"echo[{sid}]: what is 2+2")
+        # only the last user message is forwarded
+        self.assertFalse(any("OLD-QUESTION" in c["stdin"] or "OLD-QUESTION" in a
+                             for c in calls for a in c["argv"]))
+
+    def test_session_reuse_per_user(self):
+        for txt in ("hello", "hello again"):
+            r, _ = self.chat(txt, user="alice")
+            self.assertEqual(r.status, 200)
+        r, _ = self.chat("hello", user="bob")
+        self.assertEqual(r.status, 200)
+        sids = self.sids()
+        self.assertEqual(len(sids), 3)
+        self.assertEqual(sids[0], sids[1])
+        self.assertNotEqual(sids[0], sids[2])
+        self.assertTrue(all(c["argv"][0] == "send-user-msg" for c in self.calls()))
+
+    def test_text_on_stdin_verbatim(self):
+        text = "-n leading dash\nsecond line\n\n  third  "
+        r, body = self.chat(text, user="alice")
+        self.assertEqual(r.status, 200, body)
+        call = self.calls()[0]
+        self.assertEqual(call["stdin"], text)
+        self.assertNotIn(text, call["argv"])
+        self.assertTrue(self.reply(body).endswith("-n leading dash\nsecond line\n\n  third"))
+
+    def test_threads_json_bare_uuids(self):
+        self.chat("hi", user="alice")
+        self.chat("hi", user="bob")
+        alice, bob = self.sids()
+        self.assertEqual(self.threads(), {"alice": alice, "bob": bob})
+        tp = os.path.join(self.data, "threads.json")
+        self.assertEqual(stat.S_IMODE(os.stat(tp).st_mode), 0o600)
+
+    def test_fail_once_retries(self):
+        self.set_mode("fail_once")
+        r, body = self.chat("retry me")
+        self.assertEqual(r.status, 200, body)
+        self.assertIn("retry me", self.reply(body))
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_no_reply_once_retries(self):
+        self.set_mode("no_reply_once")
+        r, body = self.chat("again")
+        self.assertEqual(r.status, 200, body)
+        self.assertIn("again", self.reply(body))
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_exit3_once_retries_and_ignores_partial(self):
+        self.set_mode("exit3_once")
+        r, body = self.chat("slow one")
+        self.assertEqual(r.status, 200, body)
+        self.assertNotIn("partial", self.reply(body))
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_exit3_always_502(self):
+        self.set_mode("exit3_always")
+        r, body = self.chat("doomed")
+        self.assertEqual(r.status, 502)
+        self.assertEqual(json.loads(body)["error"]["type"], "upstream_error")
+        self.assertEqual(len(self.calls()), 2)   # exactly one retry
+
+    def test_fail_always_502(self):
+        self.set_mode("fail_always")
+        r, body = self.chat("doomed")
+        self.assertEqual(r.status, 502)
+        self.assertEqual(json.loads(body)["error"]["type"], "upstream_error")
+        self.assertEqual(len(self.calls()), 2)   # exactly one retry
+
+
+class TestSeededThreads(ShimCase):
+    """Valid stored UUIDs are reused; anything else is replaced by a new one."""
+    kept = str(uuid.uuid4())
+    seed_threads = {"alice": "not-a-uuid", "bob": kept}
+
+    def test_seeded_ids(self):
+        r, _ = self.chat("hi", user="alice")
+        self.assertEqual(r.status, 200)
+        r, _ = self.chat("hi", user="bob")
+        self.assertEqual(r.status, 200)
+        alice_sid, bob_sid = self.sids()
+        self.assertEqual(uuid.UUID(alice_sid).version, 4)
+        self.assertEqual(bob_sid, self.kept)
+        self.assertEqual(self.threads(), {"alice": alice_sid, "bob": self.kept})
 
 
 class TestMsgPrefix(ShimCase):
@@ -276,10 +350,8 @@ class TestMsgPrefix(ShimCase):
     def test_prefix_prepended_to_sent_text(self):
         r, body = self.chat("hello there", user="alice")
         self.assertEqual(r.status, 200, body)
-        sends = self.send_calls()
-        self.assertEqual(sends[0]["argv"][-1], "GLASSES>> hello there")
-        self.assertIn("GLASSES>> hello there",
-                      json.loads(body)["choices"][0]["message"]["content"])
+        self.assertEqual(self.calls()[0]["stdin"], "GLASSES>> hello there")
+        self.assertIn("GLASSES>> hello there", self.reply(body))
 
 
 class TestGeneratedKey(ShimCase):

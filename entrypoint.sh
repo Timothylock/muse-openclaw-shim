@@ -128,8 +128,7 @@ with_state() {
 # Command line that runs the shim as the shim account (if we are root) and
 # never with secrets other than SHIM_API_KEY in its environment.
 shim_cmd() {
-  SHIM_CMD=(env -u MUSE_PAIRING_B64 -u MUSE_PAIRING_FILE -u MUSEGADGET_SDK_TOKEN
-            SHIM_BACKEND="${SHIM_BACKEND:-gadget}")
+  SHIM_CMD=(env -u MUSE_PAIRING_B64 -u MUSE_PAIRING_FILE -u MUSEGADGET_SDK_TOKEN)
   if is_root; then
     id "$SHIM_USER" >/dev/null 2>&1 || die "shim account '$SHIM_USER' does not exist"
     SHIM_CMD+=(setpriv --reuid="$SHIM_USER" --regid="$SHIM_USER" --init-groups)

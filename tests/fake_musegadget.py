@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Fake `musegadget` used by the gadget-backend tests. Driven by $FAKE_GADGET_DIR:
+"""Fake `musegadget` used by the shim tests. Driven by $FAKE_GADGET_DIR:
 
   mode         one of: ok | fail_once | fail_always | exit3_once |
-               exit3_always | no_reply_once
+               exit3_always | no_reply_once | slow
   calls.jsonl  every invocation's argv + stdin is appended here
 
 Only `send-user-msg --session-id <uuid> --wait 280 -` is accepted; anything
@@ -11,6 +11,7 @@ else (run, pair, info, ...) is recorded and exits 99 so tests can spot it.
 import json
 import os
 import sys
+import time
 
 d = os.environ["FAKE_GADGET_DIR"]
 argv = sys.argv[1:]
@@ -44,6 +45,8 @@ if mode == "exit3_always" or (mode == "exit3_once" and n == 1):
     sys.exit(3)
 if mode == "no_reply_once" and n == 1:
     sys.exit(0)
+if mode == "slow":
+    time.sleep(1.2)
 
-print(f"echo[gadget:{sid}]: {stdin}")
+print(f"echo[{sid}]: {stdin}")
 sys.exit(0)

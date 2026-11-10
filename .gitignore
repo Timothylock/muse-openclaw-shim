@@ -16,7 +16,7 @@ threads.json
 # State dirs
 state/
 *-state/
-.muse-cli-shim/
+.muse-openclaw-shim/
 muse-pair/
 
 # Python

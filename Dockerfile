@@ -69,7 +69,6 @@ RUN chmod 0644 /opt/muse-openclaw-shim/shim.py /opt/muse-openclaw-shim/pairing_b
 ENV MUSEGADGET_STATE_DIR=/state \
     MUSEGADGET_SOCKET=/run-shared/musegadget.sock \
     MUSEGADGET_RUN_AS=muse \
-    SHIM_BACKEND=gadget \
     SHIM_DATA_DIR=/var/lib/muse-shim \
     HOST=0.0.0.0 \
     PORT=8080 \
