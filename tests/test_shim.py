@@ -59,6 +59,10 @@ class ShimCase(unittest.TestCase):
                     "SHIM_HEARTBEAT": "0.3"})
         env.pop("SHIM_API_KEY", None)
         env["SHIM_MSG_PREFIX"] = getattr(self, "msg_prefix", "")
+        # These suites exercise the CLI transport; the socket transport has
+        # its own suite (test_socket_transport.py).
+        env["SHIM_TRANSPORT"] = getattr(self, "transport", "cli")
+        env.update(getattr(self, "extra_env", {}))
         if self.api_key:
             env["SHIM_API_KEY"] = self.api_key
         self.proc = subprocess.Popen([sys.executable, SHIM], env=env,

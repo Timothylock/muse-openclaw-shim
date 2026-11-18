@@ -180,8 +180,25 @@ top-level `secrets:` entry with `file:` and the same ownership rule.
 | `SHIM_MODEL_ID` | `muse` | shim | Model id reported by `/v1/models`. |
 | `SHIM_MSG_PREFIX` | terse-reply instruction for glasses | shim | Text prepended to every message. Set it to an empty string to disable. |
 | `SHIM_HEARTBEAT` | `10` | shim | SSE heartbeat interval (s). |
+| `SHIM_TRANSPORT` | `socket` | shim | `socket`: talk to the service socket directly (see below). `cli`: the original `musegadget send-user-msg --wait` path. |
+| `SHIM_QUIET_S` | `12` | shim | Socket transport: seconds of silence after which a finished, non-preamble answer is returned when Muse sent no terminal task status. |
+| `SHIM_PREAMBLE_QUIET_S` | `30` | shim | Socket transport: the same silence threshold while the latest reply looks like a preamble ("Looking into it…") or Muse reports itself busy. |
 | `GADGET_CLI` | `musegadget` | shim | The `musegadget` binary the shim runs. |
 | `MUSE_PAIR_STATE_DIR` | `$XDG_DATA_HOME/muse-pair/state` | pair.sh | Where pair.sh keeps the gadget state. |
+
+### Transport
+
+By default (`SHIM_TRANSPORT=socket`) the shim sends each message straight to
+the musegadget service's local socket (`$MUSEGADGET_SOCKET`) and follows the
+side chat's event stream itself. This fixes the glasses getting only Muse's
+preamble ("Looking into it…") while the real answer, sent as a second message
+after a tool lookup, showed up only in the Muse app: the SDK's wait counted
+3 s of quiet after the preamble as "done". The shim instead returns when
+Muse reports the task finished, or after `SHIM_QUIET_S` of silence
+(`SHIM_PREAMBLE_QUIET_S` while the latest reply still looks like a preamble),
+or at the 280 s deadline. If the socket can't be reached before anything was
+sent, that request falls back to the CLI; `SHIM_TRANSPORT=cli` forces the old
+path everywhere. Details: DESIGN.md section 6.
 
 ### Shim API
 

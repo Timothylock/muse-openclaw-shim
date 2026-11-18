@@ -197,3 +197,56 @@ public SDK).
   image and entrypoint are reviewed statically. CI builds the image, and a
   first real run on a target host should exercise `run`, a `docker stop`
   (clean shutdown), and a kill of the service (container exits).
+
+## 6. Socket transport and the preamble-drop bug
+
+**The bug.** Muse often answers a gadget message in two assistant messages:
+a short preamble ("Looking into it…"), then tool work, then the real answer.
+`musegadget send-user-msg --wait` runs the SDK's `send_and_wait`, which stops
+when `MuseTurn.complete()` is true: every seen reply done, Muse not busy, and
+either a terminal task status or `REPLY_QUIET_S` (3 s) of quiet. A tool gap
+right after the preamble satisfies the quiet branch, so the CLI printed only
+the preamble, the shim sent that to the glasses, and the real answer landed
+in the chat (visible in the Muse app) after nobody was listening.
+
+**Why the fix lives in the shim.** The SDK is vendored and pinned (see
+section 5); patching it means carrying a fork across every pin bump, and the
+3 s rule is a reasonable default for other gadgets that want snappy turns.
+The service's local socket already exposes everything needed (a no-wait send
+returning the acknowledgement, and `subscribe_chat` streaming raw chat
+events), so the shim can own the completion decision without touching the
+SDK. The shim ports only the parts of `_ReplyReader` (routing by our
+acknowledged user message id, held events, seq dedup) and `MuseTurn`
+(reply text, busy flag, terminal task status, foreign-parent scoping) it
+needs. The prefix also asks Muse for one message only, which avoids the
+situation at the source when Muse complies.
+
+**Flow.** Subscribe first, then send (no wait) and take our user message
+id(s) from the acknowledgement. If the subscription errors before `ready`
+(a side chat Muse doesn't know yet), send first and subscribe right after
+the acknowledgement, as the SDK does for fresh chats. A failure to reach the
+socket before anything was sent falls back to the CLI for that request; a
+failure after the send raises an upstream error and never re-sends.
+
+**Completion rules** (first to fire wins; reply texts are joined with blank
+lines like the SDK's `_reply_text`):
+
+- **A, task finished:** a terminal task status (`completed`, `failed`,
+  `errored`, `cancelled`, `canceled`) for our turn was seen and every tracked
+  reply is done. Returns immediately. (With no text at all, the shim waits a
+  3 s grace for late text, then reports "no reply".)
+- **B, quiet:** at least one reply is done, the latest reply is not
+  preamble-only, Muse is not busy, and nothing for our turn arrived for
+  `SHIM_QUIET_S` (12 s).
+- **C, preamble guard:** while the latest reply is preamble-only
+  (`is_preamble_only`: at most 80 characters and starts with
+  looking/checking/searching/working/fetching/getting/one moment/let me/
+  I'll/I will, or ends with an ellipsis), the quiet threshold is
+  `SHIM_PREAMBLE_QUIET_S` (30 s) instead. The same longer threshold applies
+  while Muse reports itself busy (`B_busy` in the log).
+- **D, deadline:** 280 s (`SEND_WAIT`) in all. Whatever text exists is
+  returned and logged as partial; with none, the request fails. A
+  subscription that ends early behaves the same (`stream_end`).
+
+Each send logs the rule that fired, the reply count and the elapsed time,
+never message contents.
